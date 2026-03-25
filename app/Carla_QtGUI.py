@@ -1,0 +1,1433 @@
+# Copyright (c) 2026 School of Computer Science, Hangzhou Dianzi University
+#
+# This work is licensed under the terms of the MIT license.
+# For a copy, see <https://opensource.org/licenses/MIT>.
+
+import sys
+import os
+import threading
+import time
+import random
+
+project_root = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, project_root)
+import subprocess
+import math
+import time
+import random
+import configparser
+from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog
+from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QThread
+import carla
+from QT_CARLA.CARLA_tools import Ui_MainWindow
+
+# 脚本所在的目录 (app 文件夹)
+project_root = os.path.dirname(os.path.abspath(__file__))
+
+def find_config_path():
+    """
+    搜索并返回 config.ini 的有效路径。
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(current_dir)
+    search_paths = [
+        os.path.join(current_dir, 'config.ini'),
+        os.path.join(parent_dir, 'config.ini')
+    ]
+    for config_path in search_paths:
+        if os.path.exists(config_path):
+            return config_path
+    raise FileNotFoundError(f"在指定的目录中都找不到 'config.ini' 文件。搜索路径: {search_paths}")
+
+
+def load_config():
+    """
+    读取配置文件并返回配置对象。
+    """
+    config_path = find_config_path()
+    print(f"成功找到并加载配置文件: {config_path}")
+    config = configparser.ConfigParser()
+    config.read(config_path, encoding='utf-8')
+    return config
+
+
+class MyMainWindow(QMainWindow):
+    def __init__(self):
+        # 初始化
+        super().__init__()
+        self.ui = Ui_MainWindow()
+        self.ui.setupUi(self)
+        # 初始化路径变量
+        self.carla_path = ""
+        self.python_path = ""
+
+        self.client = None
+        self.world = None
+        self.map = None
+        self.car = None
+        self.follower_thread = None
+        self.speed_thread = None
+
+        # 交通生成相关
+        self.traffic_thread = None
+        self.traffic_simulation_thread = None
+        self.traffic_vehicles = []
+        self.traffic_walkers = []
+        self.traffic_walker_controllers = []
+        self.traffic_manager = None
+        self.traffic_thread_running = False
+        self.traffic_paused_for_clear = False  # 清除障碍物时暂停交通模拟
+
+        # 从 config.ini 加载所有设置并应用到UI
+        self.load_and_apply_settings()
+
+        # 设置一个 QTimer，每2秒检查一次连接状态
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh_world_data)
+        self.timer.timeout.connect(self.refresh_ifcarconnect_data)
+        self.timer.start(2000)  # 每2000毫秒（2秒）触发一次
+        # 按钮点击事件连接
+        self.connect_signals()
+
+    def connect_signals(self):
+        """将所有UI元素的信号连接到槽函数。"""
+        self.ui.pushButton_chooseCARLA.clicked.connect(self.choose_carla_path)  # 选择carla路径
+        self.ui.pushButton_choosePythonPath.clicked.connect(self.choose_python_path)
+        self.ui.pushButton_startCARLA.clicked.connect(self.start_carla_clicked)  # 启动carla
+        self.ui.pushButton_closeCARLA.clicked.connect(self.close_carla_clicked)  # 关闭carla
+        self.ui.pushButton_connectCARLA.clicked.connect(self.connect_carla_clicked)  # 连接carla
+        self.ui.pushButton_chooseMap.clicked.connect(self.change_map)  # 切换地图
+        self.ui.pushButton_setAsyn.clicked.connect(self.set_Asyn_mode)  # 设置同步模式
+        self.ui.pushButton_clearAllActor.clicked.connect(self.delete_all_actor)  # 清除所有actor
+        self.ui.pushButton_autoGetSpawnPose.clicked.connect(self.auto_get_SpawnPose)  # 自动获取生成坐标
+        self.ui.pushButton_spawnCar.clicked.connect(self.spawn_car)  # 生成车辆
+        self.ui.pushButton_spawnCarPygame.clicked.connect(self.spawn_car_pygame)  # 在pygame画面生成车辆
+        self.ui.pushButton_refreshCars.clicked.connect(lambda: self.refresh_car_data(refresh_Rolename=True))  # 更新车辆列表
+        self.ui.pushButton_connectCar.clicked.connect(self.connect_car)  # 连接车辆
+        self.ui.pushButton_setCarPose.clicked.connect(self.set_car_pose)  # 设置车辆位置
+        self.ui.pushButton_setCar_Autopilot.clicked.connect(self.set_car_autopilot)  # 设置车辆自动驾驶
+        self.ui.pushButton_clearActor_roleneme.clicked.connect(self.delete_actor_by_id)  # 删除车辆
+        self.ui.pushButton_setSpectatorPose_tocar.clicked.connect(self.set_spectator_to_car)  # 设置观测者到车辆
+        self.ui.pushButton_setSpectatorPose.clicked.connect(self.set_spectator)  # 设置观测者到指定坐标
+
+        self.ui.pushButton_SpectatorFollower_pro.clicked.connect(self.spectator_follow_pro)  # 设置观测者跟随车辆 pro
+        self.ui.pushButton_SpectatorFollower_easy.clicked.connect(self.spectator_follow_easy)  # 设置观测者跟随车辆 easy
+        self.ui.pushButton_StopSpectatorFollower.clicked.connect(self.stop_spectator_follow)  # 停止观测者跟随车辆
+        self.ui.pushButton_chooseWeather.clicked.connect(self.choose_weather)  # 设置天气
+
+        self.ui.pushButton_render.clicked.connect(self.open_render)  # 启用画面渲染
+        self.ui.pushButton_norender.clicked.connect(self.close_render)  # 禁用画面渲染
+        self.ui.pushButton_HUD2d.clicked.connect(self.open_HUD2d)  # 启用2D画面渲染
+
+        self.ui.pushButton_showSpeed.clicked.connect(self.show_vehicle_speed)  # 启用速度显示
+        self.ui.pushButton_hideSpeed.clicked.connect(self.close_vehicle_speed)  # 禁用速度显示
+
+        self.ui.pushButton_saveMemo.clicked.connect(self.save_memo)  # 保存备忘录
+
+        # 交通生成按钮连接
+        self.ui.pushButton_spawnVehicles.clicked.connect(self.spawn_vehicles)  # 生成车辆
+        self.ui.pushButton_spawnWalkers.clicked.connect(self.spawn_walkers)  # 生成行人
+        self.ui.pushButton_spawnAll.clicked.connect(self.spawn_all_traffic)  # 生成车辆+行人
+        self.ui.pushButton_destroyTraffic.clicked.connect(self.destroy_traffic)  # 清除交通
+
+    def load_and_apply_settings(self):
+        """从 config.ini 加载所有配置并设置到UI。"""
+        try:
+            config = load_config()
+
+            # 加载 CarlaSettings
+            if config.has_section('CarlaSettings'):
+                self.carla_path = config.get('CarlaSettings', 'carla_path', fallback='')
+                self.python_path = config.get('CarlaSettings', 'python_path', fallback=sys.executable)
+
+                self.ui.textBrowser_chooseCARLA.setText(self.carla_path)
+                self.ui.lineEdit_pythonPath.setText(self.python_path)
+
+                spawn_x = config.get('CarlaSettings', 'spawn_x', fallback='0')
+                spawn_y = config.get('CarlaSettings', 'spawn_y', fallback='0')
+                spawn_z = config.get('CarlaSettings', 'spawn_z', fallback='0')
+                spawn_yaw = config.get('CarlaSettings', 'spawn_yaw', fallback='0')
+
+                self.ui.lineEdit_spawnX.setText(spawn_x)
+                self.ui.lineEdit_spawnY.setText(spawn_y)
+                self.ui.lineEdit_spawnZ.setText(spawn_z)
+                self.ui.lineEdit_spawnYaw.setText(spawn_yaw)
+                self.ui.lineEdit_moveX.setText(spawn_x)
+                self.ui.lineEdit_moveY.setText(spawn_y)
+                self.ui.lineEdit_moveZ.setText(spawn_z)
+                self.ui.lineEdit_moveYaw.setText(spawn_yaw)
+
+            # 加载 Memo
+            if config.has_section('Memo') and config.has_option('Memo', 'notes'):
+                notes = config.get('Memo', 'notes')
+                self.ui.textEdit_memo.setPlainText(notes)
+
+            self.statusBar().showMessage("✅ 所有配置已成功加载。", 2000)
+            print("初始化carla_path:", self.carla_path)
+            print("初始化python_path:", self.python_path)
+
+        except Exception as e:
+            self.statusBar().showMessage(f"❌ 加载配置失败: {e}", 5000)
+
+    def choose_carla_path(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择 CARLA 启动程序", "", "可执行文件 (*.exe)")
+        if file_path:
+            self.ui.textBrowser_chooseCARLA.setText(file_path)
+            self.carla_path = file_path
+            self.save_path_to_config('carla_path', file_path)
+
+    def choose_python_path(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择 Python 解释器", "", "可执行文件 (python.exe)")
+        if file_path:
+            self.ui.lineEdit_pythonPath.setText(file_path)
+            self.python_path = file_path
+            self.save_path_to_config('python_path', file_path)
+
+    def save_path_to_config(self, key, value):
+        """通用函数，用于将路径保存到 config.ini。"""
+        try:
+            config_path = find_config_path()
+            config = configparser.ConfigParser()
+            config.read(config_path, encoding='utf-8')
+            if not config.has_section('CarlaSettings'):
+                config.add_section('CarlaSettings')
+            config.set('CarlaSettings', key, value)
+            with open(config_path, 'w', encoding='utf-8') as configfile:
+                config.write(configfile)
+            self.statusBar().showMessage(f"✅ {key} 路径已更新并保存。", 3000)
+        except Exception as e:
+            self.statusBar().showMessage(f"❌ 保存 {key} 失败: {e}", 5000)
+
+    def start_carla_clicked(self):
+        carla_path = self.carla_path
+        quality = self.ui.comboBox_quality.currentText()
+        benchmark = True
+        port = self.ui.lineEdit_port.text()
+        renderingmode = self.ui.rendering_mode.currentText()
+
+        args = [carla_path, f"-quality-level={quality}", f"-carla-world-port={port}"]
+        if benchmark:
+            args.append("-benchmark")
+        if renderingmode == "离屏渲染":
+            args.append("-RenderOffScreen")
+
+        try:
+            subprocess.Popen(args)
+            self.statusBar().showMessage(f"✅ 正在启动 CARLA (端口: {port})...", 5000)
+        except Exception as e:
+            self.statusBar().showMessage(f"❌ 启动 CARLA 失败: {e}", 5000)
+
+    def close_carla_clicked(self):
+        try:
+            if self.world:
+                self.set_Asyn_mode()
+                self.delete_all_actor()
+                self.destroy_traffic()  # 清除交通流
+            os.system("taskkill /F /IM CarlaUE4.exe >nul 2>nul")
+            os.system("taskkill /F /IM CarlaUE4-Win64-Shipping.exe >nul 2>nul")
+            self.statusBar().showMessage("✅ 已发送关闭 CARLA 命令。", 3000)
+        except Exception as e:
+            self.statusBar().showMessage(f"❌ 关闭失败: {e}", 5000)
+        finally:
+            if self.follower_thread and self.follower_thread.isRunning():
+                self.stop_spectator_follow()
+            if self.speed_thread and self.speed_thread.isRunning():
+                self.close_vehicle_speed()
+
+            self.client = self.world = self.map = self.car = self.follower_thread = None
+
+            self.ui.textBrowser_connectState.setText("未连接")
+            self.ui.textBrowser_carState.setText("无")
+            self.ui.comboBox_carRolename.clear()
+            self.statusBar().showMessage("✅ 应用状态已重置。", 3000)
+
+    def connect_carla_clicked(self):
+        try:
+            self.statusBar().showMessage("正在连接到 CARLA...", 2000)
+            ip = self.ui.lineEdit_IP.text()
+            port = int(self.ui.lineEdit_port.text())
+
+            # 1. 建立连接
+            self.client = carla.Client(ip, port)
+            self.client.set_timeout(10.0)
+            self.world = self.client.get_world()
+
+            # 2. --- 新增：获取并刷新地图列表 ---
+            # 获取服务器上的所有可用地图路径
+            available_maps = self.client.get_available_maps()
+
+            # 清空下拉框旧数据
+            self.ui.comboBox_map.clear()
+
+            # 遍历并添加到下拉框
+            # CARLA返回的通常是完整路径 "/Game/Carla/Maps/Town01"，我们需要提取最后一部分 "Town01"
+            sorted_maps = sorted([m.split('/')[-1] for m in available_maps])
+            self.ui.comboBox_map.addItems(sorted_maps)
+
+            # 3. 自动选中当前正在运行的地图
+            current_map_name = self.world.get_map().name.split('/')[-1]
+            index = self.ui.comboBox_map.findText(current_map_name)
+            if index != -1:
+                self.ui.comboBox_map.setCurrentIndex(index)
+
+            # 4. 完成提示
+            self.statusBar().showMessage(f"✅ 成功连接到 CARLA: {ip}:{port} (已加载 {len(available_maps)} 张地图)", 5000)
+            self.client.set_timeout(5.0)
+
+        except Exception as e:
+            self.statusBar().showMessage(f"❌ CARLA 连接失败: {e}", 5000)
+            self.client = self.world = None
+            # 连接失败时，为了安全起见，可以清空地图列表或保留默认
+            # self.ui.comboBox_map.clear()
+
+    def refresh_world_data(self):
+        if not self.world:
+            self.ui.textBrowser_connectState.setText("未连接")
+            return
+        try:
+            server_version = self.client.get_server_version()
+            ip_info = self.ui.lineEdit_IP.text()
+            port_info = self.ui.lineEdit_port.text()
+            mode_info = "同步模式" if self.world.get_settings().synchronous_mode else "异步模式"
+            current_map_name = self.world.get_map().name.split('/')[-1]
+
+            spectator = self.world.get_spectator()
+            transform = spectator.get_transform()
+            location = transform.location
+            rotation = transform.rotation
+            spectator_info = f"{location.x:.2f}, {location.y:.2f}, {location.z:.2f}\nYaw: {rotation.yaw:.2f}"
+
+            all_info = "\n".join([
+                f"已连接上CARLA v{server_version}",
+                f"IP: {ip_info}:{port_info}",
+                f"Map: {current_map_name}",
+                f"模式: {mode_info}",
+                f"\n观测者坐标:\n{spectator_info}"
+            ])
+            self.ui.textBrowser_connectState.setText(all_info)
+            self.refresh_car_data()
+        except RuntimeError:
+            self.ui.textBrowser_connectState.setText("未连接")
+            self.client = self.world = self.car = None
+
+    def change_map(self):
+        if not self.client:
+            self.statusBar().showMessage("❌ 请先连接到 CARLA", 3000)
+            return
+
+        selected_map = self.ui.comboBox_map.currentText()
+        try:
+            self.world = self.client.load_world(selected_map)
+            self.statusBar().showMessage(f"✅ 地图切换至 {selected_map}", 3000)
+        except Exception as e:
+            self.statusBar().showMessage("❌ 地图切换失败", 3000)
+            print(f"[ERROR] 地图切换失败: {e}")
+
+    def set_Asyn_mode(self):
+        if not self.world:
+            self.statusBar().showMessage("❌ 请先连接到 CARLA", 3000)
+            return
+        settings = self.world.get_settings()
+        settings.synchronous_mode = False
+        settings.fixed_delta_seconds = None
+        self.world.apply_settings(settings)
+        self.statusBar().showMessage("✅ 已切换到异步模式。", 2000)
+
+    def delete_all_actor(self):
+        if not self.world:
+            self.statusBar().showMessage("❌ 请先连接到 CARLA", 3000)
+            return
+        self.stop_spectator_follow()
+        count = 0
+        for actor in self.world.get_actors():
+            if actor.type_id != 'spectator':
+                actor.destroy()
+                count += 1
+        self.statusBar().showMessage(f"✅ 已清除 {count} 个 Actor。", 2000)
+
+    def auto_get_SpawnPose(self):
+        if not self.world:
+            self.statusBar().showMessage("❌ 请先连接到 CARLA", 3000)
+            return
+
+        try:
+            # 1. 获取观测者 (Spectator) 的当前位置
+            spectator = self.world.get_spectator()
+            spec_transform = spectator.get_transform()
+            spec_location = spec_transform.location
+
+            # 2. 获取当前地图
+            carla_map = self.world.get_map()
+
+            # 3. 寻找最近的 Waypoint (路点)
+            # project_to_road=True: 无论观测者在哪里（比如在天上飞），都强制投影到最近的道路几何中心
+            # lane_type=carla.LaneType.Driving: 仅限机动车道，防止吸附到人行道或路肩
+            waypoint = carla_map.get_waypoint(
+                spec_location,
+                project_to_road=True,
+                lane_type=carla.LaneType.Driving
+            )
+
+            if waypoint:
+                # 获取该路点的 Transform (包含坐标 Location 和 朝向 Rotation)
+                target_transform = waypoint.transform
+
+                # 4. 优化 Z 轴高度
+                # 直接使用路面高度可能会导致车轮陷入地面物理碰撞，通常建议抬高 0.3 到 1.0 米
+                target_transform.location.z += 0.3
+
+                # 5. 将数据填入 UI 控件 (保留2位小数)
+                self.ui.lineEdit_spawnX.setText(f"{target_transform.location.x:.2f}")
+                self.ui.lineEdit_spawnY.setText(f"{target_transform.location.y:.2f}")
+                self.ui.lineEdit_spawnZ.setText(f"{target_transform.location.z:.2f}")
+                self.ui.lineEdit_spawnYaw.setText(f"{target_transform.rotation.yaw:.2f}")
+
+                # 同时也填入“移动车辆”的输入框，方便用户直接移动已有车辆
+                self.ui.lineEdit_moveX.setText(f"{target_transform.location.x:.2f}")
+                self.ui.lineEdit_moveY.setText(f"{target_transform.location.y:.2f}")
+                self.ui.lineEdit_moveZ.setText(f"{target_transform.location.z:.2f}")
+                self.ui.lineEdit_moveYaw.setText(f"{target_transform.rotation.yaw:.2f}")
+
+                self.statusBar().showMessage(
+                    f"✅ 已自动吸附到最近道路: (X:{target_transform.location.x:.1f}, Y:{target_transform.location.y:.1f})",
+                    3000)
+            else:
+                self.statusBar().showMessage("⚠️ 当前位置附近未检测到可行驶道路。", 3000)
+
+        except Exception as e:
+            self.statusBar().showMessage(f"❌ 获取坐标失败: {e}", 5000)
+            print(f"Error in auto_get_SpawnPose: {e}")
+
+    def spawn_car(self):
+        if not self.world:
+            self.statusBar().showMessage("❌ 请先连接到 CARLA", 3000)
+            return
+        blueprint_library = self.world.get_blueprint_library()
+        car_bp = blueprint_library.find('vehicle.tesla.model3')
+        role_name = self.ui.lineEdit_spawnname.text()
+        car_bp.set_attribute('role_name', role_name)
+
+        try:
+            x = float(self.ui.lineEdit_spawnX.text())
+            y = float(self.ui.lineEdit_spawnY.text())
+            z = float(self.ui.lineEdit_spawnZ.text())
+            yaw = float(self.ui.lineEdit_spawnYaw.text())
+            spawn_point = carla.Transform(carla.Location(x=x, y=y, z=z), carla.Rotation(yaw=yaw))
+            vehicle = self.world.spawn_actor(car_bp, spawn_point)
+            self.statusBar().showMessage(f"✅ 成功生成车辆: {vehicle.attributes['role_name']}", 3000)
+            return vehicle
+        except Exception as e:
+            self.statusBar().showMessage(f"❌ 生成车辆失败: {e}", 5000)
+            return None
+
+    def spawn_car_pygame(self):
+        if not self.world:
+            self.statusBar().showMessage("❌ 请先连接到 CARLA", 3000)
+            return
+        if not self.python_path or not os.path.exists(self.python_path):
+            self.statusBar().showMessage("❌ Python 路径无效，请在服务器设置中指定。", 5000)
+            return
+        try:
+            # ... (参数获取)
+            x = float(self.ui.lineEdit_spawnX.text())
+            y = float(self.ui.lineEdit_spawnY.text())
+            z = float(self.ui.lineEdit_spawnZ.text())
+            yaw = float(self.ui.lineEdit_spawnYaw.text())
+            role_name = self.ui.lineEdit_spawnname.text() or "ego"
+            current_map = self.world.get_map().name.split('/')[-1]
+
+            # 动态构建脚本路径
+            script_path = os.path.join(project_root, "spawn_car_with_GUI.py")
+            if not os.path.exists(script_path):
+                self.statusBar().showMessage(f"❌ 错误: 找不到脚本 {script_path}", 5000)
+                return
+
+            spawn_point = f"{x}, {y}, {z}, {yaw}"
+            command = [
+                self.python_path, script_path,
+                "--spawn_point", spawn_point,
+                "--rolename", role_name, "--map", current_map,
+                "--host", self.ui.lineEdit_IP.text(), "--port", self.ui.lineEdit_port.text()
+            ]
+
+            # 设置工作目录为项目根目录 (CarlaGUI)
+            working_directory = os.path.dirname(project_root)
+            subprocess.Popen(command, cwd=working_directory)
+            self.statusBar().showMessage(f"🚗 已启动 Pygame 控制窗口: {role_name}", 4000)
+        except Exception as e:
+            self.statusBar().showMessage(f"❌ 启动 Pygame 失败: {e}", 5000)
+
+    def refresh_ifcarconnect_data(self):
+        # 连接成功时的样式
+        connected_style = """
+            background-color: #A3BE8C; /* NORD_GREEN */
+            color: #2E3440; /* TEXT_PRIMARY */
+            border: 1px solid #A3BE8C;
+            border-radius: 4px;
+            padding: 5px;
+            qproperty-alignment: 'AlignCenter';
+            font-weight: bold;
+        """
+        # 未连接时的样式
+        disconnected_style = """
+            background-color: #E5E9F0;
+            color: #4C566A; /* TEXT_SECONDARY */
+            border: 1px solid #D8DEE9; /* BORDER */
+            border-radius: 4px;
+            padding: 5px;
+            qproperty-alignment: 'AlignCenter';
+            font-weight: bold;
+        """
+
+        # 获取所有需要更新的状态标签
+        status_labels = [
+            self.ui.label_current_car_info,
+            self.ui.label_current_car_info_vehicle,
+            self.ui.label_current_car_info_spectator
+        ]
+
+        car_is_valid = False
+        car_info_text = "当前未连接车辆"
+
+        # 检查车辆是否有效
+        if self.car is not None:
+            try:
+                current_actor_ids = [actor.id for actor in self.world.get_actors()]
+                if self.car.id in current_actor_ids:
+                    car_is_valid = True
+                    rolename = self.car.attributes.get('role_name', 'N/A')
+                    actor_id = self.car.id
+                    car_info_text = f"当前控制车辆: {rolename} id={actor_id}"
+                else:
+                    self.car = None
+            except Exception as e:
+                print(f"刷新车辆连接状态时出错: {e}")
+                self.car = None
+
+        # 根据车辆是否有效，一次性更新所有标签
+        current_style = connected_style if car_is_valid else disconnected_style
+        for label in status_labels:
+            label.setText(car_info_text)
+            label.setStyleSheet(current_style)
+
+    def refresh_car_data(self, refresh_Rolename=False):
+        if not self.world: return
+
+        actors = list(self.world.get_actors().filter('vehicle.*'))
+
+        if refresh_Rolename:
+            self.ui.comboBox_carRolename.clear()
+            if not actors:
+                self.ui.comboBox_carRolename.addItem("无可用车辆")
+            else:
+                for actor in actors:
+                    rolename = actor.attributes.get('role_name', 'N/A')
+                    display_text = f"{rolename} id={actor.id}"
+                    self.ui.comboBox_carRolename.addItem(display_text, actor.id)
+            self.statusBar().showMessage("✅ 车辆列表已刷新。", 2000)
+
+        actor_data = [f"{actor.attributes.get('role_name', 'N/A')}  id={actor.id}" for actor in actors]
+        self.ui.textBrowser_carState.setText("\n".join(actor_data) if actor_data else "场景中没有车辆。")
+
+    def connect_car(self):
+        if not self.world:
+            self.statusBar().showMessage("❌ 请先连接到 CARLA", 3000)
+            return
+        try:
+            selected_id = self.ui.comboBox_carRolename.currentData()
+            if selected_id is None:
+                self.car = None
+                self.statusBar().showMessage("⚠️ 未选择车辆或车辆 ID 无效。", 2000)
+                return
+
+            vehicle = self.world.get_actor(selected_id)
+            if vehicle and 'vehicle.' in vehicle.type_id:
+                self.car = vehicle
+                rolename = vehicle.attributes.get('role_name', 'N/A')
+                self.statusBar().showMessage(f"✅ 已连接到车辆: {rolename} (ID: {vehicle.id})", 3000)
+            else:
+                self.car = None
+                self.statusBar().showMessage(f"❌ 未找到 ID 为 {selected_id} 的车辆。", 3000)
+        except Exception as e:
+            self.statusBar().showMessage(f"❌ 连接车辆失败: {e}", 5000)
+            self.car = None
+
+    def set_car_pose(self):
+        if not self.car:
+            self.statusBar().showMessage("❌ 请先连接到一辆车", 3000)
+            return
+        try:
+            x = float(self.ui.lineEdit_moveX.text())
+            y = float(self.ui.lineEdit_moveY.text())
+            z = float(self.ui.lineEdit_moveZ.text())
+            yaw = float(self.ui.lineEdit_moveYaw.text())
+            new_transform = carla.Transform(carla.Location(x=x, y=y, z=z), carla.Rotation(yaw=yaw))
+            self.car.set_transform(new_transform)
+            self.statusBar().showMessage("✅ 车辆位置已更新。", 2000)
+        except Exception as e:
+            self.statusBar().showMessage(f"❌ 设置车辆位置失败: {e}", 5000)
+
+    def set_car_autopilot(self):
+        if not self.car:
+            self.statusBar().showMessage("❌ 请先连接到一辆车", 3000)
+            return
+        try:
+            # 1. 获取当前状态
+            # 使用 getattr 检查 self.car 是否有 'autopilot_enabled' 属性
+            # 如果没有（说明是第一次设置），默认视为 False（关闭状态）
+            current_status = getattr(self.car, 'autopilot_enabled', False)
+            # 2. 状态取反 (实现切换功能)
+            new_status = not current_status
+            # 3. 执行设置
+            self.car.set_autopilot(new_status)
+            # 4. 将新状态保存回 vehicle 对象中，以便下次读取
+            self.car.autopilot_enabled = new_status
+
+            # 5. 更新 UI 反馈
+            if new_status:
+                self.statusBar().showMessage(f"🤖 已开启自动驾驶 (Role: {self.car.attributes.get('role_name')})", 3000)
+            else:
+                self.statusBar().showMessage(f"🛑 已禁用自动驾驶，交还控制权", 3000)
+
+        except Exception as e:
+            self.statusBar().showMessage(f"❌ 设置自动驾驶失败: {e}", 5000)
+
+    def delete_actor_by_id(self):
+        if not self.car:
+            self.statusBar().showMessage("❌ 请先连接到要删除的车辆", 3000)
+            return
+        try:
+            car_id = self.car.id
+            self.car.destroy()
+            self.statusBar().showMessage(f"✅ 成功销毁车辆 ID={car_id}", 3000)
+            self.car = None
+        except Exception as e:
+            self.statusBar().showMessage(f"❌ 销毁车辆失败: {e}", 5000)
+
+    def set_spectator_to_car(self):
+        if not self.car:
+            self.statusBar().showMessage("❌ 请先连接到一辆车", 3000)
+            return
+        try:
+            if self.car is None:
+                print("⚠️ 当前没有车辆")
+                return
+
+            # 获取车辆的变换（位置 + 朝向）
+            transform = self.car.get_transform()
+            location = transform.location
+            rotation = transform.rotation
+
+            # 设置观察者稍微在车辆后方和上方的位置
+            spectator = self.world.get_spectator()
+            spectator_location = location + carla.Location(x=-6 * math.cos(math.radians(rotation.yaw)),
+                                                           y=-6 * math.sin(math.radians(rotation.yaw)),
+                                                           z=3)
+            spectator_rotation = carla.Rotation(pitch=-15, yaw=rotation.yaw, roll=0)
+            spectator_transform = carla.Transform(spectator_location, spectator_rotation)
+
+            spectator.set_transform(spectator_transform)
+            self.statusBar().showMessage("✅ 观察者已移动到车辆后方。", 2000)
+        except Exception as e:
+            self.statusBar().showMessage(f"❌ 设置观察者失败: {e}", 5000)
+
+    def set_spectator(self):
+        if not self.world:
+            self.statusBar().showMessage("❌ 请先连接到 CARLA", 3000)
+            return
+        try:
+            # 获取变换（位置 + 朝向）
+            x = float(self.ui.lineEdit_spectatorX.text())
+            y = float(self.ui.lineEdit_spectatorY.text())
+            z = float(self.ui.lineEdit_spectatorZ.text())
+            yaw = float(self.ui.lineEdit_spectatorYaw.text())
+            move_pose = carla.Transform(
+                carla.Location(x=x, y=y, z=z),  # z=0.3 避免车辆陷入地面
+                carla.Rotation(yaw=yaw)
+            )
+            spectator = self.world.get_spectator()
+            spectator.set_transform(move_pose)
+            self.statusBar().showMessage("✅ 观察者位置已更新。", 2000)
+        except Exception as e:
+            self.statusBar().showMessage(f"❌ 设置观察者失败: {e}", 5000)
+
+    def spectator_follow_easy(self):
+        if not self.car:
+            self.statusBar().showMessage("❌ 请先连接到一辆车", 3000)
+            return
+        if self.follower_thread: self.follower_thread.stop()
+        self.follower_thread = SpectatorFollowerThread_easy(self.world, self.car)
+        self.follower_thread.start()
+        self.statusBar().showMessage("✅ 已启动标准跟随模式。", 2000)
+
+    def spectator_follow_pro(self):
+        if not self.car:
+            self.statusBar().showMessage("❌ 请先连接到一辆车", 3000)
+            return
+        if self.follower_thread: self.follower_thread.stop()
+        self.follower_thread = SpectatorFollowerThread_pro(self.world, self.car)
+        self.follower_thread.start()
+        self.statusBar().showMessage("✅ 已启动 Pro 跟随模式。", 2000)
+
+    def stop_spectator_follow(self):
+        if self.follower_thread:
+            self.follower_thread.stop()
+            self.statusBar().showMessage("✅ 已停止跟随。", 2000)
+        else:
+            self.statusBar().showMessage("ℹ️ 当前没有正在运行的跟随线程。", 2000)
+
+    def choose_weather(self):
+        if not self.world:
+            self.statusBar().showMessage("❌ 请先连接到 CARLA", 3000)
+            return
+        weather_type = self.ui.comboBox_weather.currentText()
+        weather_dict = {
+            "晴朗 正午": carla.WeatherParameters.ClearNoon,
+            "多云 正午": carla.WeatherParameters.CloudyNoon,
+            "湿润 正午": carla.WeatherParameters.WetNoon,
+            "湿润多云 正午": carla.WeatherParameters.WetCloudyNoon,
+            "小雨 正午": carla.WeatherParameters.SoftRainNoon,
+            "中雨 正午": carla.WeatherParameters.MidRainyNoon,
+            "大雨 正午": carla.WeatherParameters.HardRainNoon,
+            "晴朗 日出": carla.WeatherParameters.ClearSunset,
+            "多云 日出": carla.WeatherParameters.CloudySunset,
+            "湿润 日出": carla.WeatherParameters.WetSunset,
+            "小雨 日出": carla.WeatherParameters.SoftRainSunset,
+            "中雨 日出": carla.WeatherParameters.MidRainSunset,
+            "大雨 日出": carla.WeatherParameters.HardRainSunset
+        }
+        # 设置天气
+        if weather_type in weather_dict:
+            self.world.set_weather(weather_dict[weather_type])
+            self.statusBar().showMessage(f"✅ 已设置天气为: {weather_type}", 2000)
+        else:
+            self.statusBar().showMessage(f"❌ 无效天气类型: {weather_type}", 5000)
+
+    def open_render(self):
+        if not self.world:
+            self.statusBar().showMessage("❌ 请先连接到 CARLA", 3000)
+            return
+        settings = self.world.get_settings();
+        settings.no_rendering_mode = False
+        self.world.apply_settings(settings)
+        self.statusBar().showMessage("✅ 已启用渲染。", 2000)
+
+    def close_render(self):
+        if not self.world:
+            self.statusBar().showMessage("❌ 请先连接到 CARLA", 3000)
+            return
+        settings = self.world.get_settings();
+        settings.no_rendering_mode = True
+        self.world.apply_settings(settings)
+        self.statusBar().showMessage("✅ 已禁用渲染。", 2000)
+
+    def open_HUD2d(self):
+        if not self.python_path or not os.path.exists(self.python_path):
+            self.statusBar().showMessage("❌ Python 路径无效，请在服务器设置中指定。", 5000)
+            return
+
+        role_name = self.ui.lineEdit_spawnname.text()
+
+        # 动态构建脚本路径
+        script_path = os.path.join(project_root, "no_rendering_mode.py")
+        if not os.path.exists(script_path):
+            self.statusBar().showMessage(f"❌ 错误: 找不到脚本 {script_path}", 5000)
+            return
+
+        command = [self.python_path, script_path, "--role-name", role_name]
+        try:
+            # 设置工作目录为项目根目录 (CarlaGUI)
+            working_directory = os.path.dirname(project_root)
+            subprocess.Popen(command, cwd=working_directory)
+            self.statusBar().showMessage(f"🚗 已为 {role_name} 启动 2D HUD。", 3000)
+        except Exception as e:
+            self.statusBar().showMessage(f"❌ 启动 2D HUD 失败: {e}", 5000)
+
+    def show_vehicle_speed(self):
+        if not self.world:
+            self.statusBar().showMessage("❌ 请先连接到 CARLA", 3000)
+            return
+        if self.speed_thread and self.speed_thread.isRunning(): self.speed_thread.stop()
+        self.speed_thread = SpeedDisplayThread(self.world)
+        self.speed_thread.start()
+        self.statusBar().showMessage("✅ 已启动速度显示。", 2000)
+
+    def close_vehicle_speed(self):
+        if self.speed_thread and self.speed_thread.isRunning():
+            self.speed_thread.stop()
+            self.statusBar().showMessage("✅ 已停止速度显示。", 2000)
+        else:
+            self.statusBar().showMessage("ℹ️ 当前没有正在运行的速度显示线程。", 2000)
+
+    def load_memo(self):
+        """从 config.ini 加载备忘录内容。"""
+        try:
+            config = load_config()
+            if config.has_section('Memo') and config.has_option('Memo', 'notes'):
+                notes = config.get('Memo', 'notes')
+                self.ui.textEdit_memo.setPlainText(notes)
+                print("✅ 备忘录内容已加载。")
+        except Exception as e:
+            print(f"❌ 加载备忘录失败: {e}")
+
+    def save_memo(self):
+        """将备忘录内容保存到 config.ini。"""
+        try:
+            config_path = find_config_path()
+            config = configparser.ConfigParser()
+            config.read(config_path, encoding='utf-8')
+
+            if not config.has_section('Memo'):
+                config.add_section('Memo')
+
+            notes = self.ui.textEdit_memo.toPlainText()
+            config.set('Memo', 'notes', notes)
+
+            with open(config_path, 'w', encoding='utf-8') as configfile:
+                config.write(configfile)
+
+            print("✅ 备忘录已成功保存到 config.ini。")
+            # 可以在状态栏显示提示
+            self.statusBar().showMessage("备忘录已保存", 3000)
+
+        except Exception as e:
+            print(f"❌ 保存备忘录失败: {e}")
+            self.statusBar().showMessage(f"保存失败: {e}", 5000)
+
+    # ==================== 交通生成相关方法 ====================
+
+    def _get_actor_blueprints(self, world, filter, generation):
+        """获取符合条件的actor blueprints (参考 examples/generate_traffic.py)"""
+        bps = world.get_blueprint_library().filter(filter)
+        if generation.lower() == "all":
+            return bps
+        if len(bps) == 1:
+            return bps
+        try:
+            int_generation = int(generation)
+            if int_generation in [1, 2, 3]:
+                bps = [x for x in bps if int(x.get_attribute('generation')) == int_generation]
+                return bps
+            else:
+                print("   Warning! Actor Generation is not valid.")
+                return []
+        except:
+            print("   Warning! Actor Generation is not valid.")
+            return []
+
+    def _stop_traffic_threads(self):
+        """停止所有行人的AI控制器线程"""
+        for controller_id in self.traffic_walker_controllers:
+            try:
+                controller = self.world.get_actor(controller_id)
+                if controller:
+                    controller.stop()
+            except:
+                pass
+        self.traffic_walker_controllers = []
+
+    def destroy_traffic(self):
+        """销毁所有生成的交通 (车辆和行人)"""
+        if not self.world:
+            self.statusBar().showMessage("❌ 请先连接到 CARLA", 3000)
+            return
+
+        # 停止行人控制器线程
+        self._stop_traffic_threads()
+
+        # 销毁车辆
+        if self.traffic_vehicles:
+            for actor_id in self.traffic_vehicles:
+                try:
+                    actor = self.world.get_actor(actor_id)
+                    if actor:
+                        actor.destroy()
+                except:
+                    pass
+            print(f'[交通] 销毁了 {len(self.traffic_vehicles)} 辆车')
+            self.traffic_vehicles = []
+
+        # 销毁行人控制器和行人
+        if self.traffic_walkers:
+            all_walker_ids = []
+            for walker_info in self.traffic_walkers:
+                all_walker_ids.append(walker_info.get("con"))
+                all_walker_ids.append(walker_info.get("id"))
+            
+            for actor_id in all_walker_ids:
+                if actor_id:
+                    try:
+                        actor = self.world.get_actor(actor_id)
+                        if actor:
+                            actor.destroy()
+                    except:
+                        pass
+            
+            print(f'[交通] 销毁了 {len(self.traffic_walkers)} 个行人')
+            self.traffic_walkers = []
+
+        # 清理 Traffic Manager
+        if self.traffic_manager:
+            try:
+                settings = self.world.get_settings()
+                settings.synchronous_mode = False
+                settings.fixed_delta_seconds = None
+                self.world.apply_settings(settings)
+            except:
+                pass
+            self.traffic_manager = None
+
+        # 停止持续模拟线程
+        self._stop_traffic_simulation()
+
+        self.traffic_thread_running = False
+        self.ui.label_traffic_status.setText("当前无交通流")
+        self.statusBar().showMessage("✅ 已清除所有交通", 3000)
+
+    def spawn_vehicles(self):
+        """生成车辆 (默认30辆)"""
+        if not self.client:
+            self.statusBar().showMessage("❌ 请先连接到 CARLA", 3000)
+            return
+        threading.Thread(target=self._spawn_vehicles_thread, daemon=True).start()
+
+    def _spawn_vehicles_thread(self):
+        """生成车辆的线程函数"""
+        try:
+            self.statusBar().showMessage("正在生成车辆...", 2000)
+            
+            world = self.client.get_world()
+            tm_port = 8000
+            
+            # 获取 Traffic Manager
+            if not self.traffic_manager:
+                self.traffic_manager = self.client.get_trafficmanager(tm_port)
+            
+            self.traffic_manager.set_global_distance_to_leading_vehicle(2.5)
+            
+            # 设置同步模式
+            settings = world.get_settings()
+            traffic_was_sync = settings.synchronous_mode
+            
+            self.traffic_thread_running = True
+            
+            # 获取 blueprints
+            blueprints = self._get_actor_blueprints(world, 'vehicle.*', 'All')
+            if not blueprints:
+                print("Error: 无法找到车辆 blueprint")
+                return
+            
+            spawn_points = world.get_map().get_spawn_points()
+            number_of_vehicles = 140# 默认值#debug
+            
+            if number_of_vehicles > len(spawn_points):
+                number_of_vehicles = len(spawn_points)
+            
+            random.shuffle(spawn_points)
+            
+            # 批量生成车辆
+            batch = []
+            for n, transform in enumerate(spawn_points[:number_of_vehicles]):
+                blueprint = random.choice(blueprints)
+                if blueprint.has_attribute('color'):
+                    color = random.choice(blueprint.get_attribute('color').recommended_values)
+                    blueprint.set_attribute('color', color)
+                if blueprint.has_attribute('driver_id'):
+                    driver_id = random.choice(blueprint.get_attribute('driver_id').recommended_values)
+                    blueprint.set_attribute('driver_id', driver_id)
+                blueprint.set_attribute('role_name', 'autopilot')
+                
+                batch.append(carla.command.SpawnActor(blueprint, transform)
+                    .then(carla.command.SetAutopilot(carla.command.FutureActor, True, self.traffic_manager.get_port())))
+            
+            # 同步模式应用
+            sync_master = True
+            if traffic_was_sync:
+                sync_master = False
+            
+            for response in self.client.apply_batch_sync(batch, sync_master):
+                if response.error:
+                    print(f'[交通] 生成车辆错误: {response.error}')
+                else:
+                    self.traffic_vehicles.append(response.actor_id)
+            
+            # 设置车辆速度限制
+            self.traffic_manager.global_percentage_speed_difference(30.0)
+            
+            vehicle_count = len(self.traffic_vehicles)
+            print(f'[交通] 成功生成 {vehicle_count} 辆车')
+            
+            # 恢复设置
+            if not traffic_was_sync:
+                settings.synchronous_mode = False
+                settings.fixed_delta_seconds = None
+                world.apply_settings(settings)
+            
+            self.ui.label_traffic_status.setText(f"当前: {vehicle_count}辆车, {len(self.traffic_walkers)}个行人")
+            self.statusBar().showMessage(f"✅ 成功生成 {vehicle_count} 辆车", 3000)
+            
+        except Exception as e:
+            print(f'[交通] 生成车辆失败: {e}')
+            self.statusBar().showMessage(f"❌ 生成车辆失败: {e}", 5000)
+
+    def spawn_walkers(self):
+        """生成行人 (默认10个)"""
+        if not self.client:
+            self.statusBar().showMessage("❌ 请先连接到 CARLA", 3000)
+            return
+        threading.Thread(target=self._spawn_walkers_thread, daemon=True).start()
+
+    def _spawn_walkers_thread(self):
+        """生成行人的线程函数"""
+        try:
+            self.statusBar().showMessage("正在生成行人...", 2000)
+            
+            world = self.client.get_world()
+            tm_port = 8000
+            
+            # 获取 Traffic Manager
+            if not self.traffic_manager:
+                self.traffic_manager = self.client.get_trafficmanager(tm_port)
+            
+            # 设置同步模式
+            settings = world.get_settings()
+            traffic_was_sync = settings.synchronous_mode
+            
+            self.traffic_thread_running = True
+            
+            # 获取 blueprints
+            blueprintsWalkers = self._get_actor_blueprints(world, 'walker.pedestrian.*', '2')
+            if not blueprintsWalkers:
+                print("Error: 无法找到行人 blueprint")
+                return
+            
+            number_of_walkers = 40  # 默认值#debug
+            
+            spawn_points = []
+            for i in range(number_of_walkers):
+                loc = world.get_random_location_from_navigation()
+                if loc:
+                    spawn_points.append(carla.Transform(loc))
+            
+            # 批量生成行人
+            batch = []
+            walker_speed = []
+            percentagePedestriansRunning = 0.0
+            
+            for spawn_point in spawn_points:
+                walker_bp = random.choice(blueprintsWalkers)
+                if walker_bp.has_attribute('is_invincible'):
+                    walker_bp.set_attribute('is_invincible', 'false')
+                if walker_bp.has_attribute('speed'):
+                    if random.random() > percentagePedestriansRunning:
+                        walker_speed.append(walker_bp.get_attribute('speed').recommended_values[1])
+                    else:
+                        walker_speed.append(walker_bp.get_attribute('speed').recommended_values[2])
+                else:
+                    walker_speed.append(0.0)
+                batch.append(carla.command.SpawnActor(walker_bp, spawn_point))
+            
+            results = self.client.apply_batch_sync(batch, True)
+            walker_speed2 = []
+            walkers_list = []
+            
+            for i in range(len(results)):
+                if results[i].error:
+                    print(f'[交通] 生成行人错误: {results[i].error}')
+                else:
+                    walkers_list.append({"id": results[i].actor_id})
+                    walker_speed2.append(walker_speed[i])
+            
+            walker_speed = walker_speed2
+            
+            # 生成控制器
+            batch = []
+            walker_controller_bp = world.get_blueprint_library().find('controller.ai.walker')
+            for i in range(len(walkers_list)):
+                batch.append(carla.command.SpawnActor(walker_controller_bp, carla.Transform(), walkers_list[i]["id"]))
+            
+            results = self.client.apply_batch_sync(batch, True)
+            for i in range(len(results)):
+                if results[i].error:
+                    print(f'[交通] 生成行人控制器错误: {results[i].error}')
+                else:
+                    walkers_list[i]["con"] = results[i].actor_id
+                    self.traffic_walker_controllers.append(results[i].actor_id)
+            
+            # 启动行人AI
+            all_id = []
+            for walker in walkers_list:
+                all_id.append(walker["con"])
+                all_id.append(walker["id"])
+            
+            all_actors = world.get_actors(all_id)
+            
+            # 等待一帧
+            world.wait_for_tick()
+            
+            percentagePedestriansCrossing = 0.0
+            world.set_pedestrians_cross_factor(percentagePedestriansCrossing)
+            
+            for i in range(0, len(all_id), 2):
+                all_actors[i].start()
+                all_actors[i].go_to_location(world.get_random_location_from_navigation())
+                all_actors[i].set_max_speed(float(walker_speed[int(i/2)]))
+            
+            self.traffic_walkers = walkers_list
+            
+            walker_count = len(self.traffic_walkers)
+            print(f'[交通] 成功生成 {walker_count} 个行人')
+            
+            # 恢复设置
+            if not traffic_was_sync:
+                settings.synchronous_mode = False
+                settings.fixed_delta_seconds = None
+                world.apply_settings(settings)
+            
+            self.ui.label_traffic_status.setText(f"当前: {len(self.traffic_vehicles)}辆车, {walker_count}个行人")
+            self.statusBar().showMessage(f"✅ 成功生成 {walker_count} 个行人", 3000)
+            
+        except Exception as e:
+            print(f'[交通] 生成行人失败: {e}')
+            self.statusBar().showMessage(f"❌ 生成行人失败: {e}", 5000)
+
+    def spawn_all_traffic(self):
+        """同时生成车辆和行人"""
+        if not self.client:
+            self.statusBar().showMessage("❌ 请先连接到 CARLA", 3000)
+            return
+        # 先清除现有交通
+        self.destroy_traffic()
+        # 然后依次生成车辆和行人
+        threading.Thread(target=self._spawn_all_thread, daemon=True).start()
+
+    def _spawn_all_thread(self):
+        """同时生成车辆和行人的线程函数"""
+        self._spawn_vehicles_thread()
+        time.sleep(1)  # 等待一下
+        self._spawn_walkers_thread()
+        # 启动持续模拟线程
+        self._start_traffic_simulation()
+
+    def _start_traffic_simulation(self):
+        """启动持续交通模拟线程（保持交通流移动）"""
+        if self.traffic_simulation_thread and self.traffic_simulation_thread.is_alive():
+            return  # 已经在运行
+        
+        self.traffic_thread_running = True
+        self.traffic_simulation_thread = threading.Thread(target=self._traffic_simulation_loop, daemon=True)
+        self.traffic_simulation_thread.start()
+        print("[交通] 持续模拟线程已启动")
+
+    def _traffic_simulation_loop(self):
+        """交通模拟循环（参考 generate_traffic.py 的 while True 循环）"""
+        # 使用与 generate_traffic.py 相同的 tick 间隔 (0.05s = 20FPS)
+        tick_interval = 0.05
+        last_tick_time = time.time()
+        
+        try:
+            while self.traffic_thread_running:
+                # 如果正在清除障碍物，暂停 tick
+                if self.traffic_paused_for_clear:
+                    time.sleep(0.05)
+                    continue
+                
+                current_time = time.time()
+                if current_time - last_tick_time >= tick_interval:
+                    last_tick_time = current_time
+                    if self.world:
+                        try:
+                            # 同步模式下 tick，异步模式下 wait_for_tick
+                            self.world.tick()
+                        except RuntimeError:
+                            # 世界可能已关闭
+                            break
+                else:
+                    # 短暂休眠，避免CPU过高
+                    time.sleep(0.001)
+        except Exception as e:
+            print(f"[交通] 模拟循环异常: {e}")
+
+    def _stop_traffic_simulation(self):
+        """停止交通模拟线程"""
+        self.traffic_thread_running = False
+        if self.traffic_simulation_thread and self.traffic_simulation_thread.is_alive():
+            self.traffic_simulation_thread.join(timeout=2.0)
+            print("[交通] 持续模拟线程已停止")
+
+class SpectatorFollowerThread_pro(QThread): # 带运镜的跟随
+    def __init__(self, world, vehicle, x_offset=110, y_offset=60, z_offset=40, tolerance=2):
+        super().__init__()
+        self.world = world
+        self.spectator = world.get_spectator()
+        self.vehicle = vehicle
+
+        self.x_offset = x_offset
+        self.y_offset = y_offset
+        self.z_offset = z_offset
+        self.tolerance = tolerance
+
+        self._running = True  # 控制程序运行状态
+
+    def run(self):
+        while self._running:
+            try:
+                self.world.wait_for_tick()
+                self.follow_once()
+            except Exception as e:
+                print(f"线程运行异常：{e}")
+                self.stop()
+                break
+
+    def stop(self):
+        print("停止程序调用，准备退出。")
+        self._running = False
+        self.quit()  # 通知线程退出事件循环
+        self.wait()  # 等待线程完全退出
+
+    def follow_once(self):
+        if not self._running:
+            return False
+
+        if self.vehicle is None:
+            print("车辆不存在，停止更新观测者。")
+            self.stop()
+            return False
+        vehicle_transform = self.vehicle.get_transform()
+        vehicle_location = self.vehicle.get_transform().location
+        spectator_transform = self.spectator.get_transform()
+        spectator_location = spectator_transform.location
+
+        min_distance = math.sqrt(self.z_offset**2) - self.tolerance
+        max_distance = math.sqrt(self.x_offset**2 + self.y_offset**2 + self.z_offset**2) + self.tolerance
+
+        distance = vehicle_location.distance(spectator_location)
+
+        if distance < min_distance or distance > max_distance:
+            new_transform = self.get_spectator_transform()
+            self.spectator.set_transform(new_transform)
+        else:
+            new_rotation = self.get_rotation_towards(vehicle_transform, spectator_location)
+            new_transform = carla.Transform(spectator_location, new_rotation)
+            self.spectator.set_transform(new_transform)
+
+        return True
+
+    def get_spectator_transform(self):
+        transform = self.vehicle.get_transform()
+        location = transform.location
+        forward = transform.get_forward_vector()
+        right = transform.get_right_vector()
+
+        angular_velocity = self.vehicle.get_angular_velocity()
+        yaw_rate = angular_velocity.z  # 获取横摆角速度
+        threshold = 0.05  # 你可以根据需要调整阈值，单位是弧度/秒
+        if abs(yaw_rate) < threshold:
+            # 小于阈值，左右随机
+            y_offset = self.y_offset if random.random() > 0.5 else -self.y_offset
+        else:
+            # 按角速度符号确定左右
+            if yaw_rate < 0:
+                # 车辆左转，y_offset为正
+                y_offset = self.y_offset
+            else:
+                # 车辆右转，y_offset负
+                y_offset = -self.y_offset
+
+        cam_location = location + forward * self.x_offset + right * y_offset
+        cam_location.z += self.z_offset
+
+        rotation = self.get_rotation_towards(transform, cam_location)
+        return carla.Transform(cam_location, rotation)
+
+    def get_rotation_towards(self, vehicle_transform, from_location):
+        """
+        计算摄像头应朝向车辆前方10米处的旋转角度。
+
+        参数：
+            vehicle_transform: carla.Transform，车辆当前的变换信息（位置+朝向）
+            from_location: carla.Location，摄像头当前位置
+
+        返回：
+            carla.Rotation，摄像头应当的旋转角度，使其朝向车辆前方10米处
+        """
+        vehicle_location = vehicle_transform.location
+        forward = vehicle_transform.get_forward_vector()
+        # 计算车辆前方10米的位置
+        look_at_location = vehicle_location + forward * 30
+
+        # 计算摄像头位置到目标位置的方向向量
+        direction = look_at_location - from_location
+
+        # 计算yaw角（水平旋转），atan2(y, x)
+        yaw = math.degrees(math.atan2(direction.y, direction.x))
+
+        # 计算pitch角（俯仰角），atan2(z, 水平距离）
+        horizontal_dist = math.hypot(direction.x, direction.y)
+        pitch = math.degrees(math.atan2(direction.z, horizontal_dist))
+
+        # roll保持0
+        return carla.Rotation(pitch=pitch, yaw=yaw, roll=0)
+
+class SpectatorFollowerThread_easy(QThread): # 带运镜的跟随
+    def __init__(self, world, vehicle, x_offset=-20, z_offset=15, look_at_offset=5):
+        """
+        参数:
+            client (carla.Client): CARLA 客户端对象。
+            world (carla.World): CARLA 世界对象。
+            vehicle (carla.Actor): 要跟随的车辆对象。
+            x_offset (float): 旁观者相对于车辆后方的距离 (负值表示在车辆后方)。
+            z_offset (float): 旁观者相对于车辆高度的偏移量 (正值表示在车辆上方)。
+            look_at_offset (float): 旁观者看向车辆前方多少米的位置。
+        """
+        super().__init__()
+        self.world = world
+        self.spectator = world.get_spectator()
+        self.vehicle = vehicle
+
+        self.x_offset = x_offset
+        self.z_offset = z_offset
+        self.look_at_offset = look_at_offset
+
+        self._running = True  # 控制程序运行状态
+
+    def run(self):
+        while self._running:
+            try:
+                self.world.wait_for_tick(60.0)
+                self.follow_once()
+            except Exception as e:
+                print(f"线程运行异常：{e}")
+                self.stop()
+                break
+
+    def stop(self):
+        print("停止程序调用，准备退出。")
+        self._running = False
+        self.quit()  # 通知线程退出事件循环
+        self.wait()  # 等待线程完全退出
+
+    def follow_once(self):
+        if not self._running:
+            return False
+
+        if self.vehicle is None:
+            print("车辆不存在，停止更新观测者。")
+            self.stop()
+            return False
+        # 车辆位置
+        vehicle_transform = self.vehicle.get_transform()
+        vehicle_location = self.vehicle.get_transform().location
+        vehicle_forward_vector = vehicle_transform.get_forward_vector()
+
+        # 计算旁观者的新位置
+        spectator_location = carla.Location(
+            x=vehicle_location.x + vehicle_forward_vector.x * self.x_offset,
+            y=vehicle_location.y + vehicle_forward_vector.y * self.x_offset,
+            z=vehicle_location.z + self.z_offset
+        )
+
+        # 计算旁观者看向的位置（车辆前方 look_at_offset 处）
+        look_at_point = carla.Location(
+            x=vehicle_location.x + vehicle_forward_vector.x * self.look_at_offset,
+            y=vehicle_location.y + vehicle_forward_vector.y * self.look_at_offset,
+            z=vehicle_location.z # 可以稍微抬高，如果需要
+        )
+
+        # 计算从旁观者位置到目标点的旋转
+        direction_vector = look_at_point - spectator_location
+        # 确保分母不为零，避免atan2错误
+        horizontal_dist = math.sqrt(direction_vector.x**2 + direction_vector.y**2)
+        pitch = math.degrees(math.atan2(direction_vector.z, horizontal_dist)) if horizontal_dist != 0 else 0
+        yaw = math.degrees(math.atan2(direction_vector.y, direction_vector.x))
+        roll = 0.0
+
+        spectator_rotation = carla.Rotation(pitch=pitch, yaw=yaw, roll=roll)
+
+        # 更新旁观者的变换
+        new_spectator_transform = carla.Transform(spectator_location, spectator_rotation)
+        self.spectator.set_transform(new_spectator_transform)
+        return True
+
+class SpeedDisplayThread(QThread):#速度显示线程
+    """
+    一个在【所有】车辆上方实时显示速度的线程。
+    """
+
+    def __init__(self, world):  # <-- 修改点：不再需要 vehicle 参数
+        """
+        初始化速度显示线程。
+
+        参数:
+            world (carla.World): CARLA 世界对象。
+        """
+        super().__init__()
+        self.world = world
+        self._running = True  # 控制线程运行状态的标志
+
+    def run(self):
+        """
+        线程主循环。只要 _running 为 True，就持续更新所有车辆的速度显示。
+        """
+        while self._running:
+            try:
+                # 【核心修改】在每一帧开始时，获取当前世界中所有车辆的列表
+                vehicle_list = self.world.get_actors().filter('vehicle.*')
+
+                # 如果世界中没有车辆，就直接等待下一帧
+                if not vehicle_list:
+                    self.world.wait_for_tick()
+                    continue
+
+                # 遍历列表中的每一辆车
+                for vehicle in vehicle_list:
+                    # 检查车辆是否有效（可能在遍历过程中被销毁）
+                    if not vehicle.is_alive:
+                        continue
+
+                    # --- 后续逻辑与之前版本完全相同，只是作用于当前循环的 vehicle ---
+                    velocity = vehicle.get_velocity()
+                    speed_kmh = 3.6 * math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
+
+                    vehicle_location = vehicle.get_location()
+                    text_location = vehicle_location + carla.Location(y=1.0,z=2.5)
+
+                    display_text = f"{speed_kmh:.1f} km/h"
+
+                    self.world.debug.draw_string(
+                        location=text_location,
+                        text=display_text,
+                        draw_shadow=True,
+                        color=carla.Color(r=255, g=0, b=0),
+                        # life_time=0.1,
+                        persistent_lines=True
+                    )
+
+                # 在处理完当前帧的所有车辆后，等待下一个tick
+                self.world.wait_for_tick()
+
+            except RuntimeError as e:
+                print(f"线程运行时发生错误 (可能CARLA已关闭): {e}")
+                break
+            except Exception as e:
+                print(f"多车速度显示线程发生未知异常: {e}")
+                break
+
+        print("多车速度显示线程已安全退出。")
+
+    def stop(self):
+        print("正在请求停止多车速度显示线程...")
+        self._running = False
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    mainWin = MyMainWindow()
+    mainWin.show()
+    
+    # 将 MyMainWindow 实例保存到全局变量，供 spawn_car_with_GUI.py 引用
+    import Carla_QtGUI
+    Carla_QtGUI.main_window = mainWin
+    
+    sys.exit(app.exec_())
